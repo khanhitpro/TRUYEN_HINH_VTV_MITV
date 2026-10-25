@@ -1,7 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Cấp quyền toàn bộ bộ nhớ ngoài -->
     <external-path name="external_files" path="." />
+    <!-- Cấp quyền toàn bộ cache ngoài (USB/SD Card/Emulated) -->
     <external-cache-path name="external_cache" path="." />
-    <!-- THÊM DÒNG NÀY ĐỂ CHO PHÉP LAUNCHER ĐỌC ẢNH LOGO TỪ CACHE -->
-    <cache-path name="channel_logos" path="." />
+    <!-- Cấp quyền toàn bộ cache trong (cho cả logo kênh Launcher & APK cài đặt) -->
+    <cache-path name="internal_cache" path="." />
+    <!-- Cấp quyền thư mục files nội bộ -->
+    <files-path name="internal_files" path="." />
 </paths>

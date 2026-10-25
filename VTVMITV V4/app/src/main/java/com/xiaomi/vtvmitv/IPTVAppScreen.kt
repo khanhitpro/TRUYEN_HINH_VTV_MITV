@@ -8,6 +8,8 @@ import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.annotation.OptIn
 import androidx.compose.animation.*
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -19,12 +21,14 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
@@ -56,7 +60,6 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.hls.HlsMediaSource
-import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
@@ -83,6 +86,14 @@ fun IPTVAppScreen(
     var showOsd by remember { mutableStateOf(true) }
     var retryCount by remember { mutableIntStateOf(0) }
 
+    val networkState by produceState(initialValue = NetworkInfoState()) {
+        NetworkSpeedMonitor.observeNetworkSpeed(context).collect { value = it }
+    }
+
+    var isDownloading by remember { mutableStateOf(false) }
+    var downloadProgress by remember { mutableIntStateOf(0) }
+    val targetApkUrl = "https://khoappxiaomi.storetv.workers.dev/apk/mitv_update.apk"
+
     val mainFocusRequester = remember { FocusRequester() }
     val listFocusRequester = remember { FocusRequester() }
     val listState = rememberLazyListState()
@@ -98,26 +109,22 @@ fun IPTVAppScreen(
             .setKeepPostFor302Redirects(true)
 
         val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(15000, 35000, 500, 1500)
+            .setBufferDurationsMs(6000, 30000, 800, 3000)
             .setPrioritizeTimeOverSizeThresholds(true)
+            .setBackBuffer(10000, true)
             .build()
 
-        // BẬT GIẢI MÃ PHẦN CỨNG ƯU TIÊN VPU/GPU ĐỂ XỬ LÝ HÌNH ẢNH NÉT NHẤT
         val renderersFactory = DefaultRenderersFactory(context).apply {
             setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
             setEnableDecoderFallback(true)
-            setMediaCodecSelector(MediaCodecSelector.DEFAULT)
         }
 
-        // ÉP CHẶT ĐỘ PHÂN GIẢI CAO NHẤT, BỎ QUA HOÀN TOÀN CÁC PROFILE MỜ
         val selector = DefaultTrackSelector(context).apply {
             setParameters(
                 buildUponParameters()
                     .setForceHighestSupportedBitrate(true)
                     .setMinVideoSize(1280, 720)
                     .setMaxVideoSize(3840, 2160)
-                    .setMaxVideoBitrate(Int.MAX_VALUE)
-                    .setMinVideoBitrate(2_500_000)
                     .setViewportSizeToPhysicalDisplaySize(context, true)
                     .setAllowVideoMixedMimeTypeAdaptiveness(true)
                     .setAllowVideoNonSeamlessAdaptiveness(true)
@@ -129,8 +136,7 @@ fun IPTVAppScreen(
             .setTrackSelector(selector)
             .build().apply {
                 playWhenReady = true
-                // Khử kéo dãn sai tỷ lệ, ép chuẩn 16:9 sắc cạnh
-                videoScalingMode = C.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
+                videoScalingMode = C.VIDEO_SCALING_MODE_SCALE_TO_FIT
             }
 
         Triple(player, dataSourceFactory, selector)
@@ -145,6 +151,15 @@ fun IPTVAppScreen(
             val mediaItem = MediaItem.Builder()
                 .setUri(streamUrl)
                 .setMimeType(MimeTypes.APPLICATION_M3U8)
+                .setLiveConfiguration(
+                    MediaItem.LiveConfiguration.Builder()
+                        .setTargetOffsetMs(5000)
+                        .setMinOffsetMs(2000)
+                        .setMaxOffsetMs(15000)
+                        .setMinPlaybackSpeed(0.97f)
+                        .setMaxPlaybackSpeed(1.03f)
+                        .build()
+                )
                 .build()
 
             val mediaSource = HlsMediaSource.Factory(httpDataSourceFactory)
@@ -160,7 +175,6 @@ fun IPTVAppScreen(
         } catch (_: Throwable) {}
     }
 
-    // Tự động ép khóa chặt profile nét nhất ngay khi phân tích xong luồng video
     DisposableEffect(exoPlayer) {
         val tracksListener = object : Player.Listener {
             override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
@@ -196,9 +210,7 @@ fun IPTVAppScreen(
             }
         }
         exoPlayer.addListener(tracksListener)
-        onDispose {
-            exoPlayer.removeListener(tracksListener)
-        }
+        onDispose { exoPlayer.removeListener(tracksListener) }
     }
 
     LaunchedEffect(initialIndex) {
@@ -260,7 +272,6 @@ fun IPTVAppScreen(
         val listener = object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
                 val streams = currentChannel?.streamUrls ?: return
-
                 if (retryCount < 2) {
                     retryCount++
                     coroutineScope.launch {
@@ -366,7 +377,6 @@ fun IPTVAppScreen(
                 } else false
             }
     ) {
-        // TẦNG HIỂN THỊ VIDEO SURFACE VIEW CHẤT LƯỢNG CAO (RGBA_8888)
         AndroidView(
             factory = { ctx ->
                 PlayerView(ctx).apply {
@@ -381,7 +391,6 @@ fun IPTVAppScreen(
                         ViewGroup.LayoutParams.MATCH_PARENT
                     )
 
-                    // Ép tầng Surface bên dưới chạy dải màu 32-bit RGBA_8888 chống sương mù, tăng độ sâu điểm ảnh
                     val videoSurface = videoSurfaceView
                     if (videoSurface is SurfaceView) {
                         videoSurface.holder.setFormat(PixelFormat.RGBA_8888)
@@ -391,24 +400,7 @@ fun IPTVAppScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // LỚP LỌC VI CHỈNH ĐỘ TƯƠNG PHẢN (CONTRAST TUNING OVERLAY)
-        // Giúp loại bỏ màng sương mờ của luồng HLS, làm màu đen sâu thẳm và màu sắc nổi bật rõ rệt
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
-                        colors = listOf(
-                            Color.Black.copy(alpha = 0.08f),
-                            Color.Transparent,
-                            Color.Transparent,
-                            Color.Black.copy(alpha = 0.12f)
-                        )
-                    )
-                )
-        )
-
-        // OSD THÔNG TIN
+        // THANH THÔNG TIN OSD
         AnimatedVisibility(
             visible = showOsd && !showChannelList,
             enter = fadeIn() + slideInVertically { it / 2 },
@@ -476,6 +468,37 @@ fun IPTVAppScreen(
                         Box(
                             modifier = Modifier
                                 .background(Color(0xFF141414), RoundedCornerShape(6.dp))
+                                .border(1.2.dp, Color(0xFF333333), RoundedCornerShape(6.dp))
+                                .padding(horizontal = 10.dp, vertical = 5.dp)
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(7.dp)
+                                        .clip(CircleShape)
+                                        .background(if (networkState.isGoodQuality) Color(0xFF00E676) else Color(0xFFFF5252))
+                                )
+
+                                Spacer(modifier = Modifier.width(7.dp))
+
+                                Text(
+                                    text = "${networkState.connectionType} • ${networkState.speedText}",
+                                    color = if (networkState.isGoodQuality) Color.White else Color(0xFFFFD600),
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace,
+                                    style = TextStyle(
+                                        shadow = Shadow(color = Color.Black, offset = Offset(1f, 1f), blurRadius = 2f)
+                                    )
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.width(10.dp))
+
+                        Box(
+                            modifier = Modifier
+                                .background(Color(0xFF141414), RoundedCornerShape(6.dp))
                                 .border(1.2.dp, Color(0xFF444444), RoundedCornerShape(6.dp))
                                 .padding(horizontal = 10.dp, vertical = 5.dp)
                         ) {
@@ -495,7 +518,7 @@ fun IPTVAppScreen(
                             )
                         }
 
-                        Spacer(modifier = Modifier.width(12.dp))
+                        Spacer(modifier = Modifier.width(10.dp))
 
                         Box(
                             modifier = Modifier
@@ -519,66 +542,144 @@ fun IPTVAppScreen(
             }
         }
 
-        // BẢNG DANH SÁCH KÊNH
+        // BẢNG DANH SÁCH KÊNH SIDEBAR THƯƠNG MẠI
         AnimatedVisibility(
             visible = showChannelList,
-            enter = fadeIn() + slideInHorizontally { -it / 2 },
-            exit = fadeOut() + slideOutHorizontally { -it / 2 },
+            enter = fadeIn(tween(220)) + slideInHorizontally(tween(260)) { -it },
+            exit = fadeOut(tween(180)) + slideOutHorizontally(tween(220)) { -it },
             modifier = Modifier
                 .align(Alignment.CenterStart)
                 .fillMaxHeight()
-                .padding(start = 24.dp, top = 20.dp, bottom = 20.dp)
-                .width(328.dp)
+                .width(360.dp)
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .clip(RoundedCornerShape(26.dp))
-                    .background(Color(0xFF070707).copy(alpha = 0.88f))
-                    .border(
-                        width = 1.5.dp,
-                        color = Color(0xFF00E676).copy(alpha = 0.50f),
-                        shape = RoundedCornerShape(26.dp)
+                    .background(
+                        Brush.horizontalGradient(
+                            colors = listOf(
+                                Color(0xFF0C0909).copy(alpha = 0.95f),
+                                Color(0xFF100B0B).copy(alpha = 0.90f),
+                                Color(0xFF140D0D).copy(alpha = 0.80f)
+                            )
+                        )
                     )
-                    .padding(horizontal = 14.dp, vertical = 18.dp)
+                    .border(
+                        width = 1.2.dp,
+                        brush = Brush.verticalGradient(
+                            colors = listOf(
+                                Color(0xFFE50914).copy(alpha = 0.7f),
+                                Color(0xFFE50914).copy(alpha = 0.2f),
+                                Color.Transparent
+                            )
+                        ),
+                        shape = RoundedCornerShape(topEnd = 24.dp, bottomEnd = 24.dp)
+                    )
+                    .padding(start = 20.dp, end = 16.dp, top = 28.dp, bottom = 20.dp)
             ) {
-                Column(
-                    modifier = Modifier.fillMaxSize(),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Box(
+                Column(modifier = Modifier.fillMaxSize()) {
+                    // HEADER: TRUYỀN HÌNH VTV MITV
+                    Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(bottom = 16.dp),
-                        contentAlignment = Alignment.Center
+                            .padding(bottom = 18.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
+                        Column {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Box(
+                                    modifier = Modifier
+                                        .width(4.dp)
+                                        .height(18.dp)
+                                        .clip(RoundedCornerShape(2.dp))
+                                        .background(Color(0xFFE50914))
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "TRUYỀN HÌNH VTV MITV",
+                                    color = Color.White,
+                                    fontSize = 15.5.sp,
+                                    fontWeight = FontWeight.Black,
+                                    letterSpacing = 0.8.sp
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "${channels.size} Kênh phát sóng trực tiếp",
+                                color = Color(0xFFA59090),
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+
+                        // NÚT UPDATE
+                        val downloadInteraction = remember { MutableInteractionSource() }
+                        val isDownloadFocused by downloadInteraction.collectIsFocusedAsState()
+
+                        fun triggerDownload() {
+                            if (!isDownloading) {
+                                isDownloading = true
+                                downloadProgress = 0
+                                Toast.makeText(context, "Đang tải bản cập nhật...", Toast.LENGTH_SHORT).show()
+                                coroutineScope.launch {
+                                    ApkDownloader.downloadAndInstall(
+                                        context = context,
+                                        apkUrl = targetApkUrl,
+                                        onProgress = { progress -> downloadProgress = progress },
+                                        onError = { err ->
+                                            isDownloading = false
+                                            Toast.makeText(context, err, Toast.LENGTH_LONG).show()
+                                        }
+                                    )
+                                    isDownloading = false
+                                }
+                            }
+                        }
+
                         Box(
                             modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .background(Color(0xFF00E676).copy(alpha = 0.22f))
-                                .border(1.4.dp, Color(0xFF00E676), RoundedCornerShape(50))
-                                .padding(horizontal = 22.dp, vertical = 8.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(
+                                    if (isDownloadFocused) Color(0xFFE50914)
+                                    else Color(0xFF2B1416)
+                                )
+                                .border(
+                                    width = if (isDownloadFocused) 1.8.dp else 1.dp,
+                                    color = if (isDownloadFocused) Color.White else Color(0xFFE50914).copy(alpha = 0.5f),
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                .focusable(interactionSource = downloadInteraction)
+                                .clickable(interactionSource = downloadInteraction, indication = null) {
+                                    triggerDownload()
+                                }
+                                .onKeyEvent { keyEvent ->
+                                    if (keyEvent.type == KeyEventType.KeyDown &&
+                                        (keyEvent.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
+                                                keyEvent.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_ENTER ||
+                                                keyEvent.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER)
+                                    ) {
+                                        triggerDownload()
+                                        true
+                                    } else false
+                                }
+                                .padding(horizontal = 12.dp, vertical = 7.dp),
+                            contentAlignment = Alignment.Center
                         ) {
                             Text(
-                                text = "DANH SÁCH KÊNH",
-                                color = Color(0xFF00E676),
-                                fontSize = 13.5.sp,
-                                fontWeight = FontWeight.Black,
-                                letterSpacing = 1.sp,
-                                style = TextStyle(
-                                    shadow = Shadow(
-                                        color = Color.Black,
-                                        offset = Offset(1.5f, 1.5f),
-                                        blurRadius = 3f
-                                    )
-                                )
+                                text = if (isDownloading) "$downloadProgress%" else "⬇ UPDATE",
+                                color = Color.White,
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                letterSpacing = 0.5.sp
                             )
                         }
                     }
 
+                    // DANH SÁCH THẺ KÊNH
                     LazyColumn(
                         state = listState,
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
                         modifier = Modifier.fillMaxSize()
                     ) {
                         itemsIndexed(
@@ -588,7 +689,7 @@ fun IPTVAppScreen(
                             val isPlaying = index == currentChannelIndex
                             val logoResId = LauncherChannelBridge.getLocalLogoResId(context, channel.name)
 
-                            ChannelBoxItem(
+                            CommercialChannelCard(
                                 index = index,
                                 channel = channel,
                                 logoResId = logoResId,
@@ -647,8 +748,9 @@ private fun RealtimeClockBadge() {
     }
 }
 
+// THẺ KÊNH: FOCUS XANH LÁ NON RỰC RỠ, CÒN LẠI GIỮ ĐỎ THƯƠNG MẠI
 @Composable
-private fun ChannelBoxItem(
+private fun CommercialChannelCard(
     index: Int,
     channel: Channel,
     logoResId: Int,
@@ -659,20 +761,44 @@ private fun ChannelBoxItem(
     val interactionSource = remember { MutableInteractionSource() }
     val isFocused by interactionSource.collectIsFocusedAsState()
 
+    val scale by animateFloatAsState(
+        targetValue = if (isFocused) 1.03f else 1.0f,
+        animationSpec = tween(durationMillis = 150),
+        label = "CardScale"
+    )
+
+    // KHI CHỌN VÀO (FOCUS) -> SANG GRADIENT XANH LÁ NON RỰC RỠ
+    val cardBackgroundModifier = when {
+        isFocused -> Modifier.background(
+            Brush.horizontalGradient(
+                colors = listOf(
+                    Color(0xFF00E676),
+                    Color(0xFF00C853)
+                )
+            )
+        )
+        isPlaying -> Modifier.background(
+            Brush.horizontalGradient(
+                colors = listOf(
+                    Color(0xFFE50914).copy(alpha = 0.25f),
+                    Color(0xFF2B1214).copy(alpha = 0.40f)
+                )
+            )
+        )
+        else -> Modifier.background(Color(0xFF1A1314).copy(alpha = 0.55f))
+    }
+
     val cardBorderModifier = when {
-        isFocused -> Modifier.border(2.2.dp, Color(0xFF00E676), RoundedCornerShape(18.dp))
-        isPlaying -> Modifier.border(1.4.dp, Color(0xFF00E676).copy(alpha = 0.60f), RoundedCornerShape(18.dp))
-        else -> Modifier.border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(18.dp))
+        isFocused -> Modifier.border(2.dp, Color.White, RoundedCornerShape(12.dp))
+        isPlaying -> Modifier.border(1.2.dp, Color(0xFFE50914).copy(alpha = 0.75f), RoundedCornerShape(12.dp))
+        else -> Modifier.border(1.dp, Color.White.copy(alpha = 0.05f), RoundedCornerShape(12.dp))
     }
 
     var itemModifier = Modifier
         .fillMaxWidth()
-        .clip(RoundedCornerShape(18.dp))
-        .background(
-            if (isFocused) Color(0xFF00E676).copy(alpha = 0.22f)
-            else if (isPlaying) Color.Black.copy(alpha = 0.65f)
-            else Color(0xFF121212).copy(alpha = 0.40f)
-        )
+        .scale(scale)
+        .clip(RoundedCornerShape(12.dp))
+        .then(cardBackgroundModifier)
         .then(cardBorderModifier)
 
     if (itemFocusRequester != null) {
@@ -682,12 +808,7 @@ private fun ChannelBoxItem(
     Box(
         modifier = itemModifier
             .focusable(interactionSource = interactionSource)
-            .clickable(
-                interactionSource = interactionSource,
-                indication = null
-            ) {
-                onSelect()
-            }
+            .clickable(interactionSource = interactionSource, indication = null) { onSelect() }
             .onKeyEvent { keyEvent ->
                 if (keyEvent.type == KeyEventType.KeyDown &&
                     (keyEvent.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
@@ -702,46 +823,82 @@ private fun ChannelBoxItem(
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Box(
-                modifier = Modifier
-                    .width(54.dp)
-                    .height(32.dp)
-                    .clip(RoundedCornerShape(7.dp))
-                    .background(Color.White)
-                    .border(1.dp, Color.Black.copy(alpha = 0.15f), RoundedCornerShape(7.dp))
-                    .padding(horizontal = 4.dp, vertical = 2.dp),
-                contentAlignment = Alignment.Center
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
             ) {
-                Image(
-                    painter = painterResource(id = if (logoResId != 0) logoResId else R.drawable.ic_app_mitv),
-                    contentDescription = channel.name,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize()
+                // SỐ THỨ TỰ KÊNH
+                Text(
+                    text = String.format("%02d", index + 1),
+                    color = when {
+                        isFocused -> Color.Black.copy(alpha = 0.85f)
+                        isPlaying -> Color(0xFFFF5252)
+                        else -> Color(0xFF7A6B6D)
+                    },
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.width(26.dp)
+                )
+
+                // LOGO KÊNH 16:9
+                Box(
+                    modifier = Modifier
+                        .width(52.dp)
+                        .height(30.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(Color.White)
+                        .border(1.dp, Color.Black.copy(alpha = 0.12f), RoundedCornerShape(6.dp))
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Image(
+                        painter = painterResource(id = if (logoResId != 0) logoResId else R.drawable.ic_app_mitv),
+                        contentDescription = channel.name,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(12.dp))
+
+                // TÊN KÊNH
+                Text(
+                    text = channel.name,
+                    color = if (isFocused) Color.Black else Color.White,
+                    fontSize = 14.5.sp,
+                    fontWeight = if (isFocused || isPlaying) FontWeight.Black else FontWeight.SemiBold,
+                    maxLines = 1,
+                    style = TextStyle(
+                        shadow = if (isFocused) null else Shadow(
+                            color = Color.Black.copy(alpha = 0.90f),
+                            offset = Offset(1.5f, 1.5f),
+                            blurRadius = 2.5f
+                        )
+                    )
                 )
             }
 
-            Spacer(modifier = Modifier.width(14.dp))
-
-            Text(
-                text = "${index + 1}. ${channel.name}",
-                color = when {
-                    isFocused -> Color(0xFF00E676)
-                    isPlaying -> Color(0xFF69F0AE)
-                    else -> Color(0xFFFFFFFF)
-                },
-                fontSize = 15.5.sp,
-                fontWeight = if (isFocused || isPlaying) FontWeight.Black else FontWeight.Bold,
-                maxLines = 1,
-                style = TextStyle(
-                    shadow = Shadow(
-                        color = Color.Black.copy(alpha = 0.95f),
-                        offset = Offset(2f, 2f),
-                        blurRadius = 3f
+            // BADGE "LIVE" ĐỎ KHI ĐANG PHÁT KÊNH NÀY
+            if (isPlaying) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(if (isFocused) Color.Black.copy(alpha = 0.25f) else Color(0xFFE50914))
+                        .padding(horizontal = 6.dp, vertical = 2.5.dp)
+                ) {
+                    Text(
+                        text = "LIVE",
+                        color = Color.White,
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        letterSpacing = 0.5.sp
                     )
-                )
-            )
+                }
+            }
         }
     }
 }
