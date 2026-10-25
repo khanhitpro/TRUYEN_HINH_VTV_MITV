@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<searchable xmlns:android="http://schemas.android.com/apk/res/android"
+    android:label="VTV MITV"
+    android:hint="Tìm kiếm kênh truyền hình"
+    android:searchSuggestAuthority="com.xiaomi.vtvmitv.suggest"
+    android:searchSuggestIntentAction="android.intent.action.VIEW"
+    android:searchSuggestIntentData="vtvmitv://channel"
+    android:searchSuggestSelection=" ?">
+</searchable>
