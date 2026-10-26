@@ -1,3 +1,4 @@
 <resources>
+    <!-- Thay đổi tên ứng dụng bạn muốn hiển thị tại đây -->
     <string name="app_name">Truyền Hình VTV MITV</string>
 </resources>

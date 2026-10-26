@@ -1,8 +1,6 @@
 package com.xiaomi.vtvmitv
 
-import android.graphics.PixelFormat
 import android.view.KeyEvent
-import android.view.SurfaceView
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.Toast
@@ -68,6 +66,29 @@ import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+@UnstableApi
+object IPTVPlayerController {
+    var activePlayer: ExoPlayer? = null
+    var onSwitchChannel: ((Int) -> Unit)? = null
+
+    fun stopAndRelease() {
+        try {
+            activePlayer?.apply {
+                playWhenReady = false
+                stop()
+                clearMediaItems()
+            }
+        } catch (_: Throwable) {}
+    }
+
+    fun switchChannelDirectly(index: Int): Boolean {
+        return onSwitchChannel?.let {
+            it(index)
+            true
+        } ?: false
+    }
+}
 
 @OptIn(UnstableApi::class)
 @Composable
@@ -139,13 +160,19 @@ fun IPTVAppScreen(
                 videoScalingMode = C.VIDEO_SCALING_MODE_SCALE_TO_FIT
             }
 
+        IPTVPlayerController.activePlayer = player
+
         Triple(player, dataSourceFactory, selector)
     }
 
+    // HÀM PHÁT DUY NHẤT: CHUYỂN NGUỒN MƯỢT MÀ, KHÔNG GÂY TREO BỘ GIẢI MÃ
     fun playCurrentStream() {
-        if (currentChannel == null || currentChannel.streamUrls.isEmpty()) return
-        val safeIdx = currentStreamIndex.coerceIn(0, currentChannel.streamUrls.size - 1)
-        val streamUrl = currentChannel.streamUrls.getOrNull(safeIdx) ?: return
+        if (channels.isEmpty()) return
+        val channel = channels.getOrNull(currentChannelIndex) ?: return
+        if (channel.streamUrls.isEmpty()) return
+
+        val safeIdx = currentStreamIndex.coerceIn(0, channel.streamUrls.size - 1)
+        val streamUrl = channel.streamUrls.getOrNull(safeIdx) ?: return
 
         try {
             val mediaItem = MediaItem.Builder()
@@ -166,13 +193,76 @@ fun IPTVAppScreen(
                 .setAllowChunklessPreparation(true)
                 .createMediaSource(mediaItem)
 
-            exoPlayer.stop()
+            // Thay thế luồng phát trực tiếp - ExoPlayer tự động chuyển mượt, không gọi .stop() làm đơ MediaCodec
             exoPlayer.setMediaSource(mediaSource)
             exoPlayer.prepare()
-            exoPlayer.play()
+            exoPlayer.playWhenReady = true
+
             showOsd = true
-            onChannelChanged(currentChannel, currentChannelIndex)
+            onChannelChanged(channel, currentChannelIndex)
         } catch (_: Throwable) {}
+    }
+
+    // Đăng ký Callback: CHỈ CẬP NHẬT BIẾN INDEX, ĐỂ DISPOSABLEEFFECT TỰ KÍCH HOẠT PHÁT (TRÁNH GỌI KÉP)
+    DisposableEffect(channels) {
+        IPTVPlayerController.onSwitchChannel = { targetIdx ->
+            if (channels.isNotEmpty() && targetIdx in channels.indices) {
+                if (currentChannelIndex == targetIdx) {
+                    playCurrentStream()
+                } else {
+                    currentChannelIndex = targetIdx
+                    currentStreamIndex = 0
+                    retryCount = 0
+                }
+                showChannelList = false
+                showOsd = true
+            }
+        }
+        onDispose {
+            IPTVPlayerController.onSwitchChannel = null
+        }
+    }
+
+    // ĐIỂM KÍCH HOẠT DUY NHẤT: MỖI KHI ĐỔI KÊNH HOẶC ĐỔI LUỒNG
+    DisposableEffect(currentChannelIndex, currentStreamIndex) {
+        playCurrentStream()
+
+        val listener = object : Player.Listener {
+            override fun onPlayerError(error: PlaybackException) {
+                val streams = currentChannel?.streamUrls ?: return
+                if (retryCount < 2) {
+                    retryCount++
+                    coroutineScope.launch {
+                        delay(1200)
+                        playCurrentStream()
+                    }
+                    return
+                }
+
+                val nextIndex = currentStreamIndex + 1
+                if (nextIndex < streams.size) {
+                    retryCount = 0
+                    val fallbackName = if (nextIndex == 1) "Dự phòng 1" else "Dự phòng 2"
+                    Toast.makeText(context, "Đang kết nối lại $fallbackName...", Toast.LENGTH_SHORT).show()
+                    currentStreamIndex = nextIndex
+                } else {
+                    coroutineScope.launch {
+                        delay(2000)
+                        currentStreamIndex = 0
+                        retryCount = 0
+                        playCurrentStream()
+                    }
+                }
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) {
+                    retryCount = 0
+                }
+            }
+        }
+        exoPlayer.addListener(listener)
+        onDispose { exoPlayer.removeListener(listener) }
     }
 
     DisposableEffect(exoPlayer) {
@@ -213,32 +303,33 @@ fun IPTVAppScreen(
         onDispose { exoPlayer.removeListener(tracksListener) }
     }
 
-    LaunchedEffect(initialIndex) {
-        if (channels.isNotEmpty() && initialIndex in channels.indices && initialIndex != currentChannelIndex) {
-            currentChannelIndex = initialIndex
-            currentStreamIndex = 0
-            retryCount = 0
-            showChannelList = false
-            showOsd = true
-            playCurrentStream()
-        }
-    }
-
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> exoPlayer.pause()
-                Lifecycle.Event.ON_RESUME -> {
-                    if (exoPlayer.playbackState != Player.STATE_IDLE) exoPlayer.play()
+                Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> {
+                    exoPlayer.playWhenReady = false
                 }
-                Lifecycle.Event.ON_DESTROY -> exoPlayer.release()
+                Lifecycle.Event.ON_RESUME -> {
+                    if (exoPlayer.playbackState == Player.STATE_IDLE) {
+                        playCurrentStream()
+                    } else {
+                        exoPlayer.playWhenReady = true
+                    }
+                }
+                Lifecycle.Event.ON_DESTROY -> {
+                    IPTVPlayerController.stopAndRelease()
+                    exoPlayer.release()
+                    IPTVPlayerController.activePlayer = null
+                }
                 else -> {}
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
+            IPTVPlayerController.stopAndRelease()
             exoPlayer.release()
+            IPTVPlayerController.activePlayer = null
         }
     }
 
@@ -264,47 +355,6 @@ fun IPTVAppScreen(
                 try { mainFocusRequester.requestFocus() } catch (_: Throwable) {}
             }
         }
-    }
-
-    DisposableEffect(currentChannelIndex, currentStreamIndex) {
-        playCurrentStream()
-
-        val listener = object : Player.Listener {
-            override fun onPlayerError(error: PlaybackException) {
-                val streams = currentChannel?.streamUrls ?: return
-                if (retryCount < 2) {
-                    retryCount++
-                    coroutineScope.launch {
-                        delay(1200)
-                        playCurrentStream()
-                    }
-                    return
-                }
-
-                val nextIndex = currentStreamIndex + 1
-                if (nextIndex < streams.size) {
-                    retryCount = 0
-                    val fallbackName = if (nextIndex == 1) "Dự phòng 1" else "Dự phòng 2"
-                    Toast.makeText(context, "Đang kết nối lại $fallbackName...", Toast.LENGTH_SHORT).show()
-                    currentStreamIndex = nextIndex
-                } else {
-                    coroutineScope.launch {
-                        delay(2000)
-                        currentStreamIndex = 0
-                        retryCount = 0
-                        playCurrentStream()
-                    }
-                }
-            }
-
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_READY) {
-                    retryCount = 0
-                }
-            }
-        }
-        exoPlayer.addListener(listener)
-        onDispose { exoPlayer.removeListener(listener) }
     }
 
     Box(
@@ -384,17 +434,19 @@ fun IPTVAppScreen(
                     useController = false
                     isFocusable = false
                     isFocusableInTouchMode = false
+                    keepScreenOn = true
                     resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                     descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+                    setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
                     layoutParams = FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
                     )
-
-                    val videoSurface = videoSurfaceView
-                    if (videoSurface is SurfaceView) {
-                        videoSurface.holder.setFormat(PixelFormat.RGBA_8888)
-                    }
+                }
+            },
+            update = { playerView ->
+                if (playerView.player != exoPlayer) {
+                    playerView.player = exoPlayer
                 }
             },
             modifier = Modifier.fillMaxSize()
@@ -578,7 +630,6 @@ fun IPTVAppScreen(
                     .padding(start = 20.dp, end = 16.dp, top = 28.dp, bottom = 20.dp)
             ) {
                 Column(modifier = Modifier.fillMaxSize()) {
-                    // HEADER: TRUYỀN HÌNH VTV MITV
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -613,7 +664,6 @@ fun IPTVAppScreen(
                             )
                         }
 
-                        // NÚT UPDATE
                         val downloadInteraction = remember { MutableInteractionSource() }
                         val isDownloadFocused by downloadInteraction.collectIsFocusedAsState()
 
@@ -676,7 +726,6 @@ fun IPTVAppScreen(
                         }
                     }
 
-                    // DANH SÁCH THẺ KÊNH
                     LazyColumn(
                         state = listState,
                         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -748,7 +797,6 @@ private fun RealtimeClockBadge() {
     }
 }
 
-// THẺ KÊNH: FOCUS XANH LÁ NON RỰC RỠ, CÒN LẠI GIỮ ĐỎ THƯƠNG MẠI
 @Composable
 private fun CommercialChannelCard(
     index: Int,
@@ -767,7 +815,6 @@ private fun CommercialChannelCard(
         label = "CardScale"
     )
 
-    // KHI CHỌN VÀO (FOCUS) -> SANG GRADIENT XANH LÁ NON RỰC RỠ
     val cardBackgroundModifier = when {
         isFocused -> Modifier.background(
             Brush.horizontalGradient(
@@ -830,7 +877,6 @@ private fun CommercialChannelCard(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.weight(1f)
             ) {
-                // SỐ THỨ TỰ KÊNH
                 Text(
                     text = String.format("%02d", index + 1),
                     color = when {
@@ -844,7 +890,6 @@ private fun CommercialChannelCard(
                     modifier = Modifier.width(26.dp)
                 )
 
-                // LOGO KÊNH 16:9
                 Box(
                     modifier = Modifier
                         .width(52.dp)
@@ -865,7 +910,6 @@ private fun CommercialChannelCard(
 
                 Spacer(modifier = Modifier.width(12.dp))
 
-                // TÊN KÊNH
                 Text(
                     text = channel.name,
                     color = if (isFocused) Color.Black else Color.White,
@@ -882,7 +926,6 @@ private fun CommercialChannelCard(
                 )
             }
 
-            // BADGE "LIVE" ĐỎ KHI ĐANG PHÁT KÊNH NÀY
             if (isPlaying) {
                 Box(
                     modifier = Modifier
